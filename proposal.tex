@@ -1,0 +1,94 @@
+\documentclass[sigconf,10pt]{acmart}
+
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+\pagestyle{plain}
+
+\usepackage{booktabs}
+
+\title{HybridSearch: A SQLite Extension for Hybrid Vector-Keyword Retrieval}
+
+\author{Kanhaiya}
+\affiliation{\institution{Georgia Institute of Technology}}
+\email{}
+
+\begin{document}
+\maketitle
+
+\section{Problem}
+RAG systems perform hybrid retrieval by combining dense vector search (FAISS) and
+sparse keyword search (BM25) entirely at the application layer, with no database
+engine mediating access. This creates two problems. First, there is no metadata
+filtering: queries always search the entire corpus, diluting the top-\(k\) budget
+with irrelevant results even when the user's intent is clearly scoped. Second,
+incremental index updates lack atomicity: FAISS and BM25 are updated independently,
+leaving them inconsistent on failure with no recovery mechanism. Database systems
+solved both via predicate pushdown and WAL-based index maintenance; RAG systems
+have not.
+
+\section{Importance}
+As corpora grow to include textbooks, slides, and notes, scoped retrieval by
+metadata (chapter, section, source) becomes essential for precision. Inconsistent
+indexes produce silently incorrect results. These are correctness and efficiency
+problems with direct impact on deployed educational AI systems.
+
+\section{Approach}
+We build \textbf{HybridSearch}, a C++ SQLite loadable extension (compiled to a
+shared library, loaded via \texttt{sqlite3\_load\_extension}). Embedding generation
+stays in Python via TokenSmith; the extension receives query embeddings as BLOBs and
+manages all index operations via the FAISS C++ API directly.
+
+\textbf{Hybrid virtual table.} Wraps FAISS (dense) and FTS5 (BM25) into a single
+virtual table. RRF fusion is computed inside \texttt{xFilter} in C++, exposing a
+unified interface:
+\texttt{SELECT * FROM hybrid\_search WHERE query = ?\ AND chapter = 12}.
+
+\textbf{Metadata predicate pushdown.} Implements \texttt{xBestIndex} so the query
+planner pushes metadata constraints (chapter, section, page range) into the
+extension. \texttt{xFilter} translates them into a FAISS \texttt{IDSelectorBatch} for vector
+search and restricts the FTS5 query to matching chunk IDs via rowid filtering,
+following the same contract as R-Tree and FTS5.
+
+\textbf{Atomic incremental maintenance.} Embeddings and a serialized FAISS index
+(\texttt{faiss::write\_index}) are stored as BLOBs in SQLite tables. On
+\texttt{INSERT}, both BLOBs and the FTS5 virtual table are updated in a single
+transaction via SQLite WAL. On restart, the index is restored via
+\texttt{faiss::read\_index} with no recomputation.
+
+\section{Validation}
+Hybrid search results must match TokenSmith's application-layer baseline.
+Filtered results via \texttt{xBestIndex} must be equivalent to exhaustive
+post-retrieval filtering. Results after incremental updates must match a full
+rebuild.
+
+\section{Evaluation}
+Evaluation uses TokenSmith's existing benchmark suite (semantic similarity, keyword
+match, and NLI metrics over a QA set derived from \textit{Database System Concepts}).
+We measure: (1)~retrieval quality (Recall@\(k\), MRR) comparing the extension
+against the application-layer baseline; (2)~query latency comparing predicate
+pushdown against post-filter at three selectivity levels (5\%, 20\%, and 50\% of
+the corpus); and (3)~storage footprint of the unified SQLite database against the
+current scattered FAISS binary and pickle files.
+
+\section{Resources}
+\textbf{Software:} SQLite, FAISS C++, CMake, Python~3.12, sentence-transformers,
+llama-cpp-python. \textbf{Hardware:} Local CPU machine.
+\textbf{Data:} \textit{Database System Concepts} ($\sim$1,400 pages, indexed via TokenSmith).
+\textbf{Workload:} TokenSmith benchmark suite.
+
+\section{Goals}
+
+\textbf{75\% (B):} Working SQLite virtual table with FAISS and FTS5 hybrid search,
+RRF fusion in \texttt{xFilter}, integrated into TokenSmith. Benchmark confirms
+quality parity with the application-layer baseline.
+
+\textbf{100\% (A):} \texttt{xBestIndex}/\texttt{xFilter} pushing metadata
+constraints into FAISS \texttt{IDSelectorBatch} and FTS5 rowid filtering.
+Evaluation compares pushdown vs.\ post-filter latency at varying selectivities and
+measures impact on retrieval precision.
+
+\textbf{125\% (A+):} Transactional FAISS and FTS5 updates on \texttt{INSERT}/
+\texttt{DELETE} via SQLite WAL. Benchmark compares incremental update latency
+against full rebuild across batch sizes.
+
+\end{document}
