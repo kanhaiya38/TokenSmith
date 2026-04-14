@@ -1,94 +1,227 @@
-\documentclass[sigconf,10pt]{acmart}
+\documentclass[sigconf,11pt]{acmart}
 
 \settopmatter{printacmref=false}
 \renewcommand\footnotetextcopyrightpermission[1]{}
-\pagestyle{plain}
+\setcopyright{none}
+\acmConference{ADB Spring 2026}{Spring 2026}{Georgia Tech}
+\pagestyle{empty}
+\raggedbottom
+\widowpenalty=0
+\clubpenalty=0
+\displaywidowpenalty=0
 
 \usepackage{booktabs}
+\usepackage{xurl}
+\usepackage{titlesec}
+\titlespacing*{\section}{0pt}{1.5ex plus 0.5ex minus 0.5ex}{0.5ex plus 0.2ex}
+\titlespacing*{\subsection}{0pt}{1ex plus 0.5ex minus 0.3ex}{0.3ex plus 0.1ex}
+
+\begin{document}
 
 \title{HybridSearch: A SQLite Extension for Hybrid Vector-Keyword Retrieval}
 
-\author{Kanhaiya}
+\author{Kanhaiya Madaswar}
 \affiliation{\institution{Georgia Institute of Technology}}
 \email{}
 
-\begin{document}
 \maketitle
 
-\section{Problem}
-RAG systems perform hybrid retrieval by combining dense vector search (FAISS) and
-sparse keyword search (BM25) entirely at the application layer, with no database
-engine mediating access. This creates two problems. First, there is no metadata
-filtering: queries always search the entire corpus, diluting the top-\(k\) budget
-with irrelevant results even when the user's intent is clearly scoped. Second,
-incremental index updates lack atomicity: FAISS and BM25 are updated independently,
-leaving them inconsistent on failure with no recovery mechanism. Database systems
-solved both via predicate pushdown and WAL-based index maintenance; RAG systems
-have not.
+\noindent\textbf{Repository:} \url{https://github.com/kanhaiya38/TokenSmith}
 
-\section{Importance}
-As corpora grow to include textbooks, slides, and notes, scoped retrieval by
-metadata (chapter, section, source) becomes essential for precision. Inconsistent
-indexes produce silently incorrect results. These are correctness and efficiency
-problems with direct impact on deployed educational AI systems.
+\vspace{-1em}
+\section{Project Overview}
 
-\section{Approach}
-We build \textbf{HybridSearch}, a C++ SQLite loadable extension (compiled to a
-shared library, loaded via \texttt{sqlite3\_load\_extension}). Embedding generation
-stays in Python via TokenSmith; the extension receives query embeddings as BLOBs and
-manages all index operations via the FAISS C++ API directly.
+RAG systems perform hybrid retrieval by combining dense vector search (FAISS)
+and sparse keyword search (BM25) entirely at the application layer, with no
+database engine mediating access. In TokenSmith, a local RAG system for
+querying database textbooks, Python loads a FAISS index and a BM25 index as
+separate binary files, runs both searches independently, and fuses the results
+with Reciprocal Rank Fusion (RRF). This design has two problems. First, there
+is no metadata filtering: queries always search the entire corpus, diluting the
+top-$k$ budget with irrelevant results even when the user's intent is clearly
+scoped to a chapter or section. Second, incremental index updates lack
+atomicity: FAISS and BM25 are updated independently, leaving them inconsistent
+on failure with no recovery mechanism. Database systems solved both problems via
+predicate pushdown and WAL-based index maintenance; RAG systems have not.
 
-\textbf{Hybrid virtual table.} Wraps FAISS (dense) and FTS5 (BM25) into a single
-virtual table. RRF fusion is computed inside \texttt{xFilter} in C++, exposing a
-unified interface:
-\texttt{SELECT * FROM hybrid\_search WHERE query = ?\ AND chapter = 12}.
+I build \textbf{HybridSearch}, a C++ SQLite loadable extension compiled to a
+shared library and loaded via \path{sqlite3_load_extension}. The extension
+exposes hybrid retrieval as a virtual table, moving keyword search and RRF
+fusion into the database engine. Future milestones will move FAISS search fully
+into C++ inside the extension using the FAISS C++ API, add metadata predicate
+pushdown so the query planner can push \path{chapter = ?} constraints into both
+retrievers via \path{xBestIndex} and \path{xFilter}, and add transactional
+index updates via SQLite WAL.
 
-\textbf{Metadata predicate pushdown.} Implements \texttt{xBestIndex} so the query
-planner pushes metadata constraints (chapter, section, page range) into the
-extension. \texttt{xFilter} translates them into a FAISS \texttt{IDSelectorBatch} for vector
-search and restricts the FTS5 query to matching chunk IDs via rowid filtering,
-following the same contract as R-Tree and FTS5.
+\section{Current Progress}
 
-\textbf{Atomic incremental maintenance.} Embeddings and a serialized FAISS index
-(\texttt{faiss::write\_index}) are stored as BLOBs in SQLite tables. On
-\texttt{INSERT}, both BLOBs and the FTS5 virtual table are updated in a single
-transaction via SQLite WAL. On restart, the index is restored via
-\texttt{faiss::read\_index} with no recomputation.
+\subsection{C++ SQLite Extension}
 
-\section{Validation}
-Hybrid search results must match TokenSmith's application-layer baseline.
-Filtered results via \texttt{xBestIndex} must be equivalent to exhaustive
-post-retrieval filtering. Results after incremental updates must match a full
-rebuild.
+The file \path{extension/hybrid_search.cpp} (~290 lines) implements the full
+\path{sqlite3_module} virtual table interface. The module registers a virtual
+table named \path{hybrid_search} with two visible output columns
+(\path{chunk_id}, \path{score}) and three hidden input columns
+(\path{faiss_results}, \path{query_text}, \path{top_k}).
 
-\section{Evaluation}
-Evaluation uses TokenSmith's existing benchmark suite (semantic similarity, keyword
-match, and NLI metrics over a QA set derived from \textit{Database System Concepts}).
-We measure: (1)~retrieval quality (Recall@\(k\), MRR) comparing the extension
-against the application-layer baseline; (2)~query latency comparing predicate
-pushdown against post-filter at three selectivity levels (5\%, 20\%, and 50\% of
-the corpus); and (3)~storage footprint of the unified SQLite database against the
-current scattered FAISS binary and pickle files.
+\path{xBestIndex} is a minimal stub that marks the three hidden columns as
+usable equality constraints. \path{xFilter} is the core of the extension. It
+unpacks a caller-supplied BLOB of FAISS-ranked chunk IDs into a
+\path{faiss_ranks} map (chunk\_id to 1-based rank), runs an FTS5 \path{MATCH}
+query against the \path{chunks_fts} virtual table on the same database
+connection to obtain \path{fts5_ranks}, fuses both ranked lists using RRF with
+$k=60$ and equal weights of 0.5 each, and materializes up to \path{top_k} rows
+into the cursor sorted by descending fused score.
 
-\section{Resources}
-\textbf{Software:} SQLite, FAISS C++, CMake, Python~3.12, sentence-transformers,
-llama-cpp-python. \textbf{Hardware:} Local CPU machine.
-\textbf{Data:} \textit{Database System Concepts} ($\sim$1,400 pages, indexed via TokenSmith).
-\textbf{Workload:} TokenSmith benchmark suite.
+A CMake build file (\path{extension/CMakeLists.txt}) compiles the extension as
+\path{hybrid_search.so} inside the conda environment. \path{make build-extension}
+drives the full configure and build pipeline.
 
-\section{Goals}
+\subsection{Index Migration}
 
-\textbf{75\% (B):} Working SQLite virtual table with FAISS and FTS5 hybrid search,
-RRF fusion in \texttt{xFilter}, integrated into TokenSmith. Benchmark confirms
-quality parity with the application-layer baseline.
+\path{src/index_migration.py} is a one-time migration script that converts the
+existing TokenSmith binary artifacts into a single SQLite database at
+\path{index/tokensmith.db}. It reads the chunks pickle (1,825 chunks, 2.7 MB)
+and metadata pickle (508 KB), inserts them into a \path{chunks} table with
+columns for text, source, section path, and page range, and populates a
+\path{chunks_fts} FTS5 virtual table via an FTS5 rebuild command. It then loads
+the compiled extension and registers the \path{hybrid_search} virtual table.
+The database uses WAL journal mode for concurrent read access.
+\path{make migrate-db} runs the migration end-to-end.
 
-\textbf{100\% (A):} \texttt{xBestIndex}/\texttt{xFilter} pushing metadata
-constraints into FAISS \texttt{IDSelectorBatch} and FTS5 rowid filtering.
-Evaluation compares pushdown vs.\ post-filter latency at varying selectivities and
-measures impact on retrieval precision.
+\subsection{Python Integration}
 
-\textbf{125\% (A+):} Transactional FAISS and FTS5 updates on \texttt{INSERT}/
-\texttt{DELETE} via SQLite WAL. Benchmark compares incremental update latency
-against full rebuild across batch sizes.
+A new \path{HybridSQLiteRetriever} class in \path{src/retriever.py} sits
+alongside the existing \path{FAISSRetriever} and \path{BM25Retriever}. It
+accepts the FAISS index object loaded in Python, runs FAISS search in Python,
+packs the resulting ranked \path{chunk_id} list as a little-endian \path{int64}
+BLOB via \path{struct.pack}, and passes it to the C++ virtual table together
+with the raw query string. The virtual table then handles FTS5 and RRF fusion.
+The return format is identical to existing retrievers, a
+\path{{chunk_id: score}} dict, making it a drop-in replacement.
+
+A \path{retrieval_backend} flag in \path{config/config.yaml} set to either
+\path{"faiss"} or \path{"sqlite"} toggles between the original pipeline and the
+new one without breaking existing functionality. The existing benchmark suite
+and evaluation metrics remain unchanged.
+
+\section{Challenges and Observations}
+
+\textbf{FAISS and SQLite boundary.} In the current milestone, FAISS search runs
+in Python and communicates ranked chunk IDs to the extension via a packed BLOB.
+This was a deliberate scoping decision: it allowed the virtual table interface,
+FTS5 integration, and RRF fusion to be built and validated end-to-end before
+adding FAISS C++ integration. The BLOB serves as the communication channel
+between Python's FAISS invocation and C++ RRF computation. The final checkpoint
+will eliminate this boundary by moving FAISS search fully inside \path{xFilter}
+using the FAISS C++ API, with the serialized index stored as a BLOB in a
+\path{faiss_index} table.
+
+\textbf{SQLite extension entry-point naming.} SQLite derives the entry-point
+symbol from the \path{.so} filename by inserting underscores between words, so
+\path{hybrid_search.so} maps to \path{sqlite3_hybrid_search_init}. An initial
+mismatch with \path{sqlite3_hybridsearch_init} caused a \path{dlsym} failure at
+load time since the symbol could not be resolved. C++ name mangling was an
+additional issue that required wrapping the entry point in
+\path{extern "C"}. The Python 3.12 \path{load_extension} \path{entrypoint}
+keyword argument was used to make the name explicit and avoid this class of
+error going forward.
+
+\textbf{FTS5 versus BM25 scores.} SQLite's FTS5 \path{rank} column uses BM25
+internally but returns negative values where more negative means better match,
+which differs numerically from the \path{rank_bm25} Python library used by the
+existing \path{BM25Retriever}. Since RRF uses only rank positions and not raw
+scores, this difference does not affect fusion quality. However, it means FTS5
+scores cannot be substituted for BM25 scores in a linear fusion setting, which
+is worth noting for any future experiments with weighted linear fusion.
+
+\section{Next Steps}
+
+\textbf{End-to-end benchmarking.} The immediate next step is running the
+existing benchmark suite (\path{tests/test_benchmarks.py}) with the SQLite
+backend enabled to measure Recall@$k$ and MRR against the FAISS-only baseline
+across all 11 benchmark queries. This confirms quality parity and validates that
+FTS5 plus FAISS RRF fusion matches the Python-side BM25 plus FAISS baseline. I
+will also report the storage footprint of the unified \path{tokensmith.db}
+against the current scattered FAISS binary and pickle files.
+
+\textbf{FAISS C++ integration inside the extension.} The central remaining
+deliverable is moving FAISS search from Python into C++ \path{xFilter}. This
+requires installing \path{libfaiss} with C++ headers via conda-forge,
+serializing the FAISS index as a BLOB in a \path{faiss_index} table during
+migration, deserializing it on \path{xCreate} and \path{xConnect} into a live
+\path{faiss::Index} object, and calling \path{index->search()} directly inside
+the extension. This eliminates the BLOB handoff from Python entirely and makes
+the extension self-contained: a single SQL query with an embedding BLOB is all
+the caller needs to issue.
+
+\textbf{Metadata predicate pushdown.} Once FAISS runs in C++,
+\path{xBestIndex} will declare \path{chapter =}, \path{section =}, and page
+range as pushable constraints with lower \path{estimatedCost} when filters are
+present, following the same contract as R-Tree and FTS5. \path{xFilter} will
+translate them into a \path{faiss::IDSelectorBatch} for vector search and a
+rowid restriction clause for FTS5. Correctness will be validated by asserting
+that filtered results match exhaustive post-retrieval filtering. Latency will be
+measured and compared against post-filter at three corpus selectivity levels of
+5\%, 20\%, and 50\%.
+
+\textbf{Transactional index updates.} On \path{INSERT} into the corpus, both
+\path{chunks_fts} and the serialized FAISS BLOB will be updated within a single
+SQLite WAL transaction, giving incremental updates the same atomicity guarantees
+as any other SQLite write. I will compare incremental update latency against a
+full index rebuild across varying batch sizes.
+
+\clearpage
+
+\appendix
+\section*{Appendix: Learning Episode -- Two-Phase Locking}
+
+\textbf{Topic:} Two-Phase Locking (2PL)
+
+\bigskip
+
+\noindent\textbf{Question 1:} What is the growing phase in two-phase locking?
+
+\smallskip
+\noindent\textbf{Correct textbook chunk(s):}
+\begin{quote}
+One protocol that ensures serializability is the two-phase locking protocol.
+This protocol requires that each transaction issue lock and unlock requests in
+two phases: (1) \textit{Growing phase}: A transaction may obtain locks, but may
+not release any lock.
+\end{quote}
+
+\bigskip
+
+\noindent\textbf{Question 2:} What is the shrinking phase in two-phase locking,
+and what is the lock point?
+
+\smallskip
+\noindent\textbf{Correct textbook chunk(s):}
+\begin{quote}
+\textit{Shrinking phase}: A transaction may release locks, but may not obtain
+any new locks. Initially, a transaction is in the growing phase. The transaction
+acquires locks as needed. Once the transaction releases a lock, it enters the
+shrinking phase, and it can issue no more lock requests. The point in the
+schedule where the transaction has obtained its final lock (the end of its
+growing phase) is called the lock point of the transaction. Transactions can be
+ordered according to their lock points --- this ordering is, in fact, a
+serializability ordering for the transactions.
+\end{quote}
+
+\bigskip
+
+\noindent\textbf{Question 3:} What constraint does strict 2PL add on top of
+basic 2PL, and why?
+
+\smallskip
+\noindent\textbf{Correct textbook chunk(s):}
+\begin{quote}
+Cascading rollbacks can be avoided by a modification of two-phase locking called
+the strict two-phase locking protocol. This protocol requires not only that
+locking be two phase, but also that all exclusive-mode locks taken by a
+transaction be held until that transaction commits. This requirement ensures that
+any data written by an uncommitted transaction are locked in exclusive mode until
+the transaction commits, preventing any other transaction from reading the data.
+\end{quote}
 
 \end{document}

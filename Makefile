@@ -1,12 +1,14 @@
-.PHONY: help env build-llama clean test run-index run-chat run-index-partial run-add-chapters-partial run-chat-partial install update-env
+.PHONY: help env build-llama build-extension migrate-db clean test run-index run-chat run-index-partial run-add-chapters-partial run-chat-partial install update-env
 
 help:
 	@echo "TokenSmith - RAG Application (Conda Dependencies)"
 	@echo "Available targets:"
 	@echo "  env         - Create conda environment with all dependencies"
 	@echo "  update-env  - Update environment from environment.yml"
-	@echo "  build-llama - Build llama.cpp (if not found)"  
-	@echo "  install     - Install package in development mode"
+	@echo "  build-llama      - Build llama.cpp (if not found)"
+	@echo "  build-extension  - Build HybridSearch C++ SQLite extension"
+	@echo "  migrate-db       - Migrate FAISS/pkl artifacts to index/tokensmith.db"
+	@echo "  install          - Install package in development mode"
 	@echo "  test        - Run tests"
 	@echo "  clean       - Clean build artifacts"
 	@echo "  show-deps   - Show installed conda packages"
@@ -35,6 +37,21 @@ build-llama:
 # Install package in development mode (no dependencies, they're from conda)
 install:
 	conda run -n tokensmith pip install -e . --no-deps
+
+# Build the HybridSearch C++ SQLite extension
+build-extension:
+	@echo "Building HybridSearch SQLite extension..."
+	@mkdir -p extension/build
+	conda run -n tokensmith cmake -B extension/build extension/ \
+		-DCMAKE_PREFIX_PATH=$$(conda run -n tokensmith python -c "import sys; print(sys.prefix)") \
+		-DCMAKE_BUILD_TYPE=Release
+	conda run -n tokensmith cmake --build extension/build --parallel
+	@echo "Extension built: extension/build/hybrid_search.so"
+
+# Migrate FAISS/pkl artifacts to tokensmith.db (run after build-extension)
+migrate-db:
+	@echo "Migrating artifacts to index/tokensmith.db ..."
+	conda run --no-capture-output -n tokensmith python -m src.index_migration
 
 # Full build process
 build: env install

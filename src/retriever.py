@@ -160,6 +160,59 @@ class BM25Retriever(Retriever):
         return scores
 
 
+class HybridSQLiteRetriever(Retriever):
+    """
+    Retriever backed by the HybridSearch SQLite extension.
+
+    FAISS search runs in Python (via the existing index); the ranked chunk_id
+    list is serialised as a packed-int64 BLOB and handed to the C++ virtual
+    table, which runs FTS5 on `chunks_fts` and fuses both ranked lists with
+    RRF.  Return format: {chunk_id: score}, matching FAISSRetriever.
+    """
+    name = "hybrid_sqlite"
+
+    def __init__(self, db_path: str, extension_path: str, embed_model: str,
+                 faiss_index):
+        import sqlite3 as _sqlite3
+        self._db_path   = str(db_path)
+        self._ext_path  = str(pathlib.Path(extension_path).resolve())
+        self.embedder   = _get_embedder(embed_model)
+        self.faiss_idx  = faiss_index
+        # Validate extension loads on construction.
+        conn = _sqlite3.connect(self._db_path)
+        conn.enable_load_extension(True)
+        conn.load_extension(self._ext_path, entrypoint="sqlite3_hybrid_search_init")
+        conn.close()
+
+    def get_scores(self, query: str, pool_size: int,
+                   chunks: List[str]) -> Dict[int, float]:
+        import sqlite3 as _sqlite3
+        import struct
+
+        # FAISS search in Python
+        q_vec = self.embedder.encode([query]).astype("float32")
+        k = min(pool_size, self.faiss_idx.ntotal)
+        distances, indices = self.faiss_idx.search(q_vec, k)
+        valid_ids = [int(i) for i in indices[0] if 0 <= i < len(chunks)]
+
+        # Pack chunk_ids in rank order as little-endian int64 sequence.
+        faiss_blob = struct.pack(f"<{len(valid_ids)}q", *valid_ids)
+
+        # FTS5 + RRF fusion in C++ extension
+        conn = _sqlite3.connect(self._db_path)
+        conn.enable_load_extension(True)
+        conn.load_extension(self._ext_path, entrypoint="sqlite3_hybrid_search_init")
+
+        rows = conn.execute(
+            "SELECT chunk_id, score FROM hybrid_search "
+            "WHERE faiss_results = ? AND query_text = ? AND top_k = ?",
+            (faiss_blob, query, pool_size),
+        ).fetchall()
+        conn.close()
+
+        return {int(chunk_id): float(score) for chunk_id, score in rows}
+
+
 class IndexKeywordRetriever(Retriever):
     name = "index_keywords"
     

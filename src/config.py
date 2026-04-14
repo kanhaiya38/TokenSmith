@@ -63,6 +63,11 @@ class RAGConfig:
     # user feedback modeling
     enable_topic_extraction: bool = False
 
+    # sqlite hybrid-search backend
+    retrieval_backend: str = "faiss"   # "faiss" or "sqlite"
+    sqlite_db: str = "index/tokensmith.db"
+    extension_path: str = "extension/build/hybrid_search.so"
+
     # ---------- factory + validation ----------
     @classmethod
     def from_yaml(cls, path: os.PathLike) -> RAGConfig:

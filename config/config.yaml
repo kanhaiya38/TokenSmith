@@ -23,3 +23,6 @@ semantic_cache_enabled: false
 semantic_cache_bi_encoder_threshold: 0.90
 semantic_cache_cross_encoder_threshold: 0.99
 enable_topic_extraction: false
+retrieval_backend: "faiss"
+sqlite_db: "index/tokensmith.db"
+extension_path: "extension/build/hybrid_search.so"
