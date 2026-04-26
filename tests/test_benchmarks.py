@@ -1,4 +1,5 @@
 import json
+import os
 import pytest
 from pathlib import Path
 from datetime import datetime
@@ -24,18 +25,31 @@ def test_tokensmith_benchmarks(benchmarks, config, results_dir):
     # Run each benchmark
     passed = 0
     failed = 0
-    
+    recall_scores = []
+    mrr_scores = []
+
     for benchmark in benchmarks:
         result = run_benchmark(benchmark, config, results_dir, scorer)
         if result["passed"]:
             passed += 1
         else:
             failed += 1
-    
+        if result.get("recall_at_k") is not None:
+            recall_scores.append(result["recall_at_k"])
+        if result.get("mrr") is not None:
+            mrr_scores.append(result["mrr"])
+
     # Print summary
+    top_k = config.get("top_k", 10)
     print(f"\n{'='*60}")
     print(f"  SUMMARY: {passed} passed, {failed} failed")
-    print(f"{'='*60}\n")
+    if recall_scores:
+        print(f"  Macro Recall@{top_k}: {sum(recall_scores)/len(recall_scores):.3f}")
+    if mrr_scores:
+        print(f"  Macro MRR:      {sum(mrr_scores)/len(mrr_scores):.3f}")
+    print(f"{'='*60}")
+    _print_storage_report()
+    print()
 
 
 def print_test_config(config, scorer):
@@ -53,7 +67,8 @@ def print_test_config(config, scorer):
     #     print(f"    • FAISS weight:   {config['faiss_weight']:.2f}")
     #     print(f"    • BM25 weight:    {config['bm25_weight']:.2f}")
     #     print(f"    • Tag weight:     {config['tag_weight']:.2f}")
-    
+
+    print(f"  Retrieval Backend:  {config.get('retrieval_backend', 'faiss')}")
     print(f"  System Prompt:      {config['system_prompt_mode']}")
     print(f"  Chunks Enabled:     {not config['disable_chunks']}")
     print(f"  Golden Chunks:      {config['use_golden_chunks']}")
@@ -121,7 +136,16 @@ def run_benchmark(benchmark, config, results_dir, scorer):
     # Check if test passed
     final_score = scores.get("final_score", 0)
     passed = final_score >= threshold
-    
+
+    # Compute retrieval rank metrics (Recall@k, MRR)
+    recall_val = None
+    mrr_val = None
+    if ideal_retrieved_chunks and chunks_info:
+        retrieved_ids = [c["chunk_id"] for c in chunks_info]
+        recall_val = _recall_at_k(retrieved_ids, ideal_retrieved_chunks, config.get("top_k", 10))
+        mrr_val = _mrr(retrieved_ids, ideal_retrieved_chunks)
+        print(f"  Recall@{config.get('top_k', 10)}: {recall_val:.3f}   MRR: {mrr_val:.3f}")
+
     # Print result
     print_result(benchmark_id, passed, final_score, threshold, scores, config["output_mode"], retrieved_answer)
     
@@ -138,6 +162,8 @@ def run_benchmark(benchmark, config, results_dir, scorer):
         "active_metrics": scores.get("active_metrics", []),
         "metric_weights": get_metric_weights(scorer, scores.get("active_metrics", [])),
         "chunks_info": chunks_info if chunks_info else [],
+        "recall_at_k": recall_val,
+        "mrr": mrr_val,
         "hyde_query": hyde_query if hyde_query else None,
         "timestamp": datetime.now().isoformat(),
         "config": {
@@ -229,23 +255,39 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         index_prefix=config["index_prefix"]
     )
 
-    retrievers = [
-        FAISSRetriever(faiss_index, cfg.embed_model),
-        BM25Retriever(bm25_index)
-    ]
-    
-    # Add index keyword retriever if weight > 0
-    if cfg.ranker_weights.get("index_keywords", 0) > 0:
-        retrievers.append(
-            IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path)
+    retrieval_backend = config.get("retrieval_backend", "faiss")
+
+    if retrieval_backend == "sqlite":
+        from src.retriever import HybridSQLiteRetriever
+        print(f"  🗄️  Using SQLite hybrid backend...")
+        sqlite_retriever = HybridSQLiteRetriever(
+            db_path=config.get("sqlite_db", "index/tokensmith.db"),
+            extension_path=config.get("extension_path", "extension/build/hybrid_search.so"),
+            embed_model=cfg.embed_model,
+            faiss_index=faiss_index,
         )
-    
-    ranker = EnsembleRanker(
-        ensemble_method=cfg.ensemble_method,
-        weights=cfg.ranker_weights,
-        rrf_k=int(cfg.rrf_k)
-    )
-    
+        retrievers = [sqlite_retriever]
+        ranker = EnsembleRanker(
+            ensemble_method="rrf",
+            weights={"hybrid_sqlite": 1.0},
+            rrf_k=int(cfg.rrf_k),
+        )
+    else:
+        retrievers = [
+            FAISSRetriever(faiss_index, cfg.embed_model),
+            BM25Retriever(bm25_index)
+        ]
+        # Add index keyword retriever if weight > 0
+        if cfg.ranker_weights.get("index_keywords", 0) > 0:
+            retrievers.append(
+                IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path)
+            )
+        ranker = EnsembleRanker(
+            ensemble_method=cfg.ensemble_method,
+            weights=cfg.ranker_weights,
+            rrf_k=int(cfg.rrf_k),
+        )
+
     # Package artifacts for reuse
     artifacts = {
         "chunks": chunks,
@@ -370,6 +412,44 @@ def log_failure(results_dir, benchmark_id, message):
         f.write(f"{'='*60}\n")
         f.write(f"{message}\n")
         f.write(f"{'='*60}\n")
+
+
+def _recall_at_k(retrieved_ids, ideal_ids, k):
+    """Fraction of ideal chunks found in the top-k retrieved chunks."""
+    if not ideal_ids:
+        return 0.0
+    top_k = set(retrieved_ids[:k])
+    return len(top_k & set(ideal_ids)) / len(ideal_ids)
+
+
+def _mrr(retrieved_ids, ideal_ids):
+    """Reciprocal rank of the first relevant chunk (0 if none found)."""
+    ideal_set = set(ideal_ids)
+    for rank, cid in enumerate(retrieved_ids, start=1):
+        if cid in ideal_set:
+            return 1.0 / rank
+    return 0.0
+
+
+def _print_storage_report():
+    """Print storage comparison: tokensmith.db vs. scattered index files."""
+    from pathlib import Path
+    root = Path(".")
+    db_path = root / "index" / "tokensmith.db"
+    db_size = db_path.stat().st_size if db_path.exists() else 0
+
+    scattered = []
+    for pattern in ["*.faiss", "*_bm25.pkl", "*_chunks.pkl", "*_sources.pkl", "*_meta.pkl"]:
+        scattered.extend(root.glob(f"index/**/{pattern}"))
+    scattered_size = sum(f.stat().st_size for f in scattered)
+
+    print(f"\n{'─'*60}")
+    print(f"  Storage Footprint")
+    print(f"{'─'*60}")
+    print(f"  tokensmith.db :  {db_size / 1024:.1f} KB")
+    if scattered:
+        print(f"  Scattered files: {scattered_size / 1024:.1f} KB ({len(scattered)} files)")
+    print(f"{'─'*60}")
 
 
 def format_failure_message(question, expected, retrieved, final_score, threshold, scores):

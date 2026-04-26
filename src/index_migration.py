@@ -22,7 +22,6 @@ import argparse
 import pathlib
 import pickle
 import sqlite3
-import struct
 import sys
 
 
@@ -55,6 +54,13 @@ def migrate(
             print(f"ERROR: required file not found: {p}", file=sys.stderr)
             sys.exit(1)
 
+    import faiss as _faiss
+
+    faiss_path = artifacts_dir / f"{index_prefix}.faiss"
+    if not faiss_path.exists():
+        print(f"ERROR: required file not found: {faiss_path}", file=sys.stderr)
+        sys.exit(1)
+
     chunks: list[str]    = pickle.load(open(chunks_path, "rb"))
     metadata: list[dict] = pickle.load(open(meta_path, "rb"))
     sources: list[str]   = (
@@ -62,11 +68,12 @@ def migrate(
         if sources_path.exists()
         else [""] * len(chunks)
     )
+    faiss_index = _faiss.read_index(str(faiss_path))
 
     n = len(chunks)
     print(f"  {n} chunks loaded.")
+    print(f"  FAISS index: {faiss_index.ntotal} vectors, dim={faiss_index.d}")
 
-    # open / create SQLite database
     db_path.parent.mkdir(parents=True, exist_ok=True)
     if db_path.exists():
         db_path.unlink()
@@ -114,6 +121,16 @@ def migrate(
     """)
     conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('rebuild')")
     print("  Built FTS5 index (chunks_fts).")
+
+    conn.execute("""
+        CREATE TABLE faiss_index (
+            id   INTEGER PRIMARY KEY,
+            data BLOB    NOT NULL
+        )
+    """)
+    faiss_blob = _faiss.serialize_index(faiss_index).tobytes()
+    conn.execute("INSERT INTO faiss_index(id, data) VALUES(1, ?)", (faiss_blob,))
+    print(f"  Stored FAISS index BLOB ({len(faiss_blob) / 1024:.1f} KB) in faiss_index.")
 
     conn.commit()
 

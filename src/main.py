@@ -379,16 +379,13 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     print("Initializing TokenSmith Chat...")
     try:
         if cfg.retrieval_backend == "sqlite":
-            import sqlite3 as _sqlite3
             print(f"Using SQLite hybrid-search backend ({cfg.sqlite_db})")
-            # Load chunks and FAISS index from the existing artifacts.
             artifacts_dir = cfg.get_artifacts_directory()
-            faiss_idx, _, chunks, sources, meta = load_artifacts(artifacts_dir, args.index_prefix)
-            # Also read chunks from DB (sanity check; prefer pkl ordering).
-            print(f"Loaded {len(chunks)} chunks and FAISS index for sqlite backend.")
+            _, _, chunks, sources, meta = load_artifacts(artifacts_dir, args.index_prefix)
+            print(f"Loaded {len(chunks)} chunks for sqlite backend.")
             retrievers = [
                 HybridSQLiteRetriever(
-                    cfg.sqlite_db, cfg.extension_path, cfg.embed_model, faiss_idx
+                    cfg.sqlite_db, cfg.extension_path, cfg.embed_model
                 )
             ]
             ranker = EnsembleRanker(
@@ -397,12 +394,14 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 rrf_k=int(cfg.rrf_k),
             )
         else:
-            artifacts_dir = cfg.get_artifacts_directory()
+            artifacts_dir = cfg.get_artifacts_directory(partial=args.partial)
+            cfg.page_to_chunk_map_path = cfg.get_page_to_chunk_map_path(artifacts_dir, args.index_prefix)
             faiss_idx, bm25_idx, chunks, sources, meta = load_artifacts(artifacts_dir, args.index_prefix)
             print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from artifacts.")
             retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
             if cfg.ranker_weights.get("index_keywords", 0) > 0:
                 retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
+
             ranker = EnsembleRanker(ensemble_method=cfg.ensemble_method, weights=cfg.ranker_weights, rrf_k=int(cfg.rrf_k))
 
         print("Loaded retrievers and initialized ranker.")

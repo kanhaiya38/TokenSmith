@@ -102,7 +102,7 @@ class FAISSRetriever(Retriever):
         """
         # FAISS expects a 2D array
         q_vec = self.embedder.encode([query]).astype("float32")
-        
+
         # Safety check on vector dimensions
         if q_vec.shape[1] !=  self.index.d:
             raise ValueError(
@@ -150,7 +150,7 @@ class BM25Retriever(Retriever):
 
         # Remove invalid indices and ensure they are within bounds
         top_k_indices = [i for i in top_k_indices if 0 <= i < len(chunks)]
-        
+
         # Get the corresponding scores for the top indices
         top_scores = all_scores[top_k_indices]
 
@@ -161,65 +161,54 @@ class BM25Retriever(Retriever):
 
 
 class HybridSQLiteRetriever(Retriever):
-    """
-    Retriever backed by the HybridSearch SQLite extension.
-
-    FAISS search runs in Python (via the existing index); the ranked chunk_id
-    list is serialised as a packed-int64 BLOB and handed to the C++ virtual
-    table, which runs FTS5 on `chunks_fts` and fuses both ranked lists with
-    RRF.  Return format: {chunk_id: score}, matching FAISSRetriever.
-    """
     name = "hybrid_sqlite"
 
-    def __init__(self, db_path: str, extension_path: str, embed_model: str,
-                 faiss_index):
+    def __init__(self, db_path: str, extension_path: str, embed_model: str ):
         import sqlite3 as _sqlite3
-        self._db_path   = str(db_path)
-        self._ext_path  = str(pathlib.Path(extension_path).resolve())
-        self.embedder   = _get_embedder(embed_model)
-        self.faiss_idx  = faiss_index
-        # Validate extension loads on construction.
-        conn = _sqlite3.connect(self._db_path)
+        self.embedder = _get_embedder(embed_model)
+        conn = _sqlite3.connect(str(db_path), check_same_thread=False)
         conn.enable_load_extension(True)
-        conn.load_extension(self._ext_path, entrypoint="sqlite3_hybrid_search_init")
-        conn.close()
+        conn.load_extension(str(pathlib.Path(extension_path).resolve()),
+                            entrypoint="sqlite3_hybrid_search_init")
+        self._conn = conn
 
     def get_scores(self, query: str, pool_size: int,
-                   chunks: List[str]) -> Dict[int, float]:
-        import sqlite3 as _sqlite3
-        import struct
-
-        # FAISS search in Python
+                   chunks: List[str],
+                   source: Optional[str] = None,
+                   section: Optional[str] = None,
+                   page_start: Optional[int] = None,
+                   page_end: Optional[int] = None) -> Dict[int, float]:
         q_vec = self.embedder.encode([query]).astype("float32")
-        k = min(pool_size, self.faiss_idx.ntotal)
-        distances, indices = self.faiss_idx.search(q_vec, k)
-        valid_ids = [int(i) for i in indices[0] if 0 <= i < len(chunks)]
+        emb_blob = q_vec.tobytes()
 
-        # Pack chunk_ids in rank order as little-endian int64 sequence.
-        faiss_blob = struct.pack(f"<{len(valid_ids)}q", *valid_ids)
+        sql = ("SELECT chunk_id, score FROM hybrid_search "
+               "WHERE query_embedding = ? AND query_text = ? AND top_k = ?")
+        params: list = [emb_blob, query, pool_size]
 
-        # FTS5 + RRF fusion in C++ extension
-        conn = _sqlite3.connect(self._db_path)
-        conn.enable_load_extension(True)
-        conn.load_extension(self._ext_path, entrypoint="sqlite3_hybrid_search_init")
+        if source is not None:
+            sql += " AND source = ?"
+            params.append(source)
+        if section is not None:
+            sql += " AND section = ?"
+            params.append(section)
+        if page_start is not None:
+            sql += " AND page_start = ?"
+            params.append(page_start)
+        if page_end is not None:
+            sql += " AND page_end = ?"
+            params.append(page_end)
 
-        rows = conn.execute(
-            "SELECT chunk_id, score FROM hybrid_search "
-            "WHERE faiss_results = ? AND query_text = ? AND top_k = ?",
-            (faiss_blob, query, pool_size),
-        ).fetchall()
-        conn.close()
-
+        rows = self._conn.execute(sql, params).fetchall()
         return {int(chunk_id): float(score) for chunk_id, score in rows}
 
 
 class IndexKeywordRetriever(Retriever):
     name = "index_keywords"
-    
+
     def __init__(self, extracted_index_path: os.PathLike, page_to_chunk_map_path: os.PathLike):
         """
         Retriever that uses textbook index keywords to boost chunks on relevant pages.
-        
+
         Args:
             extracted_index_path: Path to extracted_index.json (keyword -> page numbers)
             page_to_chunk_map_path: Path to page_to_chunk_map.json (page -> chunk IDs)
@@ -227,32 +216,32 @@ class IndexKeywordRetriever(Retriever):
         import json
         nltk.download('wordnet', quiet=True)
         self.page_to_chunk_map = {}
-        
+
         # Load and normalize index: lemmatize phrases as units
         # Build token->phrase mapping for fast lookup
         if os.path.exists(extracted_index_path):
             lemmatizer = WordNetLemmatizer()
-            
+
             with open(extracted_index_path, 'r') as f:
                 raw_index = json.load(f)
                 self.phrase_to_pages = {}  # phrase -> pages
                 self.token_to_phrases = {}  # token -> [phrases]
-                
+
                 for key, pages in raw_index.items():
                     # Lemmatize each word in the phrase but keep phrase together
                     key_lower = key.lower()
                     words = key_lower.split()
                     lemmatized_words = []
-                    
+
                     for word in words:
                         cleaned = word.strip('.,!?()[]:"\'')
                         if not cleaned:
                             continue
                         lemmatized_words.append(self._lemmatize_word(cleaned, lemmatizer))
-                    
+
                     lemmatized_phrase = ' '.join(lemmatized_words)
                     self.phrase_to_pages[lemmatized_phrase] = pages
-                    
+
                     # Build reverse index: each token points to phrases containing it
                     for token in lemmatized_words:
                         if token not in self.token_to_phrases:
@@ -261,11 +250,11 @@ class IndexKeywordRetriever(Retriever):
         else:
             self.phrase_to_pages = {}
             self.token_to_phrases = {}
-        
+
         if os.path.exists(page_to_chunk_map_path):
             with open(page_to_chunk_map_path, 'r') as f:
                 self.page_to_chunk_map = json.load(f)
-    
+
     def get_scores(self, query: str, pool_size: int, chunks: List[str]) -> Dict[int, float]:
         """
         Returns scores for chunks that match index keywords.
@@ -273,38 +262,38 @@ class IndexKeywordRetriever(Retriever):
         """
         keywords = self._extract_keywords(query)
         # chunk_id -> hit count
-        chunk_hit_counts: Dict[int, int] = {} 
-        
+        chunk_hit_counts: Dict[int, int] = {}
+
         # Match query keywords against index phrases (token overlap)
         for keyword in keywords:
             if keyword not in self.token_to_phrases:
                 continue
-            
+
             # Get all phrases containing this keyword token
             matching_phrases = self.token_to_phrases[keyword]
-            
+
             for phrase in matching_phrases:
                 page_numbers = self.phrase_to_pages[phrase]
-                
+
                 # Map pages to chunks
                 for page_no in page_numbers:
                     chunk_ids = self.page_to_chunk_map.get(str(page_no), [])
                     for chunk_id in chunk_ids:
                         if chunk_id >= 0 and chunk_id < len(chunks):
                             chunk_hit_counts[chunk_id] = chunk_hit_counts.get(chunk_id, 0) + 1
-        
+
         if not chunk_hit_counts:
             return {}
-        
+
         # Normalize scores: more keyword hits = higher score
         max_hits = max(chunk_hit_counts.values())
         scores = {
             chunk_id: float(hit_count) / max_hits
             for chunk_id, hit_count in chunk_hit_counts.items()
         }
-        
+
         return scores
-    
+
     @staticmethod
     def _lemmatize_word(word: str, lemmatizer) -> str:
         """Lemmatize a word, trying noun then verb."""
@@ -312,17 +301,17 @@ class IndexKeywordRetriever(Retriever):
         if lemma == word:
             lemma = lemmatizer.lemmatize(word, pos='v')
         return lemma
-    
+
     @staticmethod
     def _extract_keywords(query: str) -> List[str]:
         """Extract keywords from query by removing stopwords and lemmatizing."""
-        
+
         stopwords = {
             "the", "is", "at", "which", "on", "for", "a", "an", "and", "or", "in",
-            "to", "of", "by", "with", "that", "this", "it", "as", "are", "was", 
+            "to", "of", "by", "with", "that", "this", "it", "as", "are", "was",
             "what", "how", "why", "when", "where", "who", "does", "do", "be"
         }
-        
+
         lemmatizer = WordNetLemmatizer()
         words = query.lower().split()
         keywords = []

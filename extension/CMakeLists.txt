@@ -15,6 +15,9 @@ if(NOT SQLITE3_FOUND)
     find_library(SQLITE3_LIBRARIES NAMES sqlite3)
 endif()
 
+# FAISS (C++ library with headers — installed via conda-forge libfaiss)
+find_package(faiss REQUIRED)
+
 # shared library
 add_library(hybrid_search SHARED hybrid_search.cpp)
 
@@ -25,6 +28,7 @@ target_include_directories(hybrid_search PRIVATE
 # Do NOT link libsqlite3: the extension receives the sqlite3_api_routines
 # pointer at load time via SQLITE_EXTENSION_INIT2.
 # target_link_libraries(hybrid_search PRIVATE ${SQLITE3_LIBRARIES})
+target_link_libraries(hybrid_search PRIVATE faiss)
 
 # remove the default "lib" prefix so output is hybrid_search.so
 set_target_properties(hybrid_search PROPERTIES PREFIX "")

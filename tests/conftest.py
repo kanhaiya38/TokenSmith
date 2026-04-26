@@ -118,7 +118,14 @@ def pytest_addoption(parser):
         default=None,
         help="Override similarity threshold for all tests"
     )
-    
+
+    group.addoption(
+        "--retrieval-backend",
+        choices=["faiss", "sqlite"],
+        default=None,
+        help="Retrieval backend: 'faiss' (default) or 'sqlite' hybrid extension (overrides config)"
+    )
+
     # === Utility Options ===
     group.addoption(
         "--list-metrics",
@@ -177,6 +184,11 @@ def config(pytestconfig):
         # Query Enhancement (HyDE)
         "use_hyde": cfg.get("use_hyde", False),
         "hyde_max_tokens": cfg.get("hyde_max_tokens", 300),
+
+        # SQLite hybrid backend
+        "retrieval_backend": pytestconfig.getoption("--retrieval-backend") or cfg.get("retrieval_backend", "faiss"),
+        "sqlite_db": cfg.get("sqlite_db", "index/tokensmith.db"),
+        "extension_path": cfg.get("extension_path", "extension/build/hybrid_search.so"),
     }
 
     # Handle enable/disable chunks
