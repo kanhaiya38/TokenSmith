@@ -72,6 +72,7 @@ struct HybridVtab {
     sqlite3*                      db;
     std::unique_ptr<faiss::Index> faiss_idx;
     faiss::idx_t                  txn_ntotal{-1};  // ntotal snapshot at xBegin; -1 = no active txn
+    bool                          dirty{false};    // true if in-memory index has unflushed adds
 };
 
 struct HybridCursor {
@@ -551,27 +552,12 @@ static int hybridUpdate(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv,
     sqlite3_finalize(stmt);
     if (rc != SQLITE_DONE) return SQLITE_ERROR;
 
-    // 3. Add vector to in-memory FAISS index via add() — new ID = ntotal before add
+    // 3. Add vector to in-memory FAISS index; BLOB is flushed once in xSync.
     if (vtab->faiss_idx &&
         emb_bytes == vtab->faiss_idx->d * static_cast<int>(sizeof(float))) {
         const float* vec = static_cast<const float*>(emb_blob);
-        vtab->faiss_idx->add(1, vec);  // IndexFlatL2 assigns sequential IDs
-
-        // 4. Re-serialize FAISS index and persist to faiss_index table
-        faiss::VectorIOWriter writer;
-        try {
-            faiss::write_index(vtab->faiss_idx.get(), &writer);
-        } catch (...) {
-            return SQLITE_ERROR;
-        }
-        const char* upd_sql = "UPDATE faiss_index SET data=? WHERE id=1";
-        rc = sqlite3_prepare_v2(db, upd_sql, -1, &stmt, nullptr);
-        if (rc != SQLITE_OK) return rc;
-        sqlite3_bind_blob(stmt, 1, writer.data.data(),
-                          static_cast<int>(writer.data.size()), SQLITE_TRANSIENT);
-        rc = sqlite3_step(stmt);
-        sqlite3_finalize(stmt);
-        if (rc != SQLITE_DONE) return SQLITE_ERROR;
+        vtab->faiss_idx->add(1, vec);
+        vtab->dirty = true;
     }
 
     return SQLITE_OK;
@@ -585,7 +571,36 @@ static int hybridBegin(sqlite3_vtab* pVtab) {
 }
 
 static int hybridCommit(sqlite3_vtab* pVtab) {
-    reinterpret_cast<HybridVtab*>(pVtab)->txn_ntotal = -1;
+    HybridVtab* vtab = reinterpret_cast<HybridVtab*>(pVtab);
+    vtab->txn_ntotal = -1;
+    vtab->dirty      = false;
+    return SQLITE_OK;
+}
+
+// Called once before the transaction commits — serialize the index here so
+// N inserts in one transaction cost one BLOB write instead of N.
+static int hybridSync(sqlite3_vtab* pVtab) {
+    HybridVtab* vtab = reinterpret_cast<HybridVtab*>(pVtab);
+    if (!vtab->dirty || !vtab->faiss_idx) return SQLITE_OK;
+
+    faiss::VectorIOWriter writer;
+    try {
+        faiss::write_index(vtab->faiss_idx.get(), &writer);
+    } catch (...) {
+        return SQLITE_ERROR;
+    }
+
+    const char* upd_sql = "UPDATE faiss_index SET data=? WHERE id=1";
+    sqlite3_stmt* stmt  = nullptr;
+    int rc = sqlite3_prepare_v2(vtab->db, upd_sql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) return rc;
+    sqlite3_bind_blob(stmt, 1, writer.data.data(),
+                      static_cast<int>(writer.data.size()), SQLITE_TRANSIENT);
+    rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) return SQLITE_ERROR;
+
+    vtab->dirty = false;
     return SQLITE_OK;
 }
 
@@ -602,6 +617,7 @@ static int hybridRollback(sqlite3_vtab* pVtab) {
         }
     }
     vtab->txn_ntotal = -1;
+    vtab->dirty      = false;
     return SQLITE_OK;
 }
 
@@ -622,7 +638,7 @@ static sqlite3_module hybridSearchModule = {
     hybridRowid,      // xRowid
     hybridUpdate,     // xUpdate
     hybridBegin,      // xBegin
-    nullptr,          // xSync
+    hybridSync,       // xSync
     hybridCommit,     // xCommit
     hybridRollback,   // xRollback
     nullptr,          // xFindMethod
