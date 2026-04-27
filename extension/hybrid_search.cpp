@@ -68,9 +68,10 @@ static const int FILT_PAGE_END   = 1 << 3;
 
 // virtual table structures
 struct HybridVtab {
-    sqlite3_vtab              base;       // must be first
-    sqlite3*                  db;
+    sqlite3_vtab                  base;        // must be first
+    sqlite3*                      db;
     std::unique_ptr<faiss::Index> faiss_idx;
+    faiss::idx_t                  txn_ntotal{-1};  // ntotal snapshot at xBegin; -1 = no active txn
 };
 
 struct HybridCursor {
@@ -576,6 +577,34 @@ static int hybridUpdate(sqlite3_vtab* pVtab, int argc, sqlite3_value** argv,
     return SQLITE_OK;
 }
 
+// xBegin / xCommit / xRollback
+static int hybridBegin(sqlite3_vtab* pVtab) {
+    HybridVtab* vtab   = reinterpret_cast<HybridVtab*>(pVtab);
+    vtab->txn_ntotal   = vtab->faiss_idx ? vtab->faiss_idx->ntotal : 0;
+    return SQLITE_OK;
+}
+
+static int hybridCommit(sqlite3_vtab* pVtab) {
+    reinterpret_cast<HybridVtab*>(pVtab)->txn_ntotal = -1;
+    return SQLITE_OK;
+}
+
+// SQLite has already rolled back the DB before calling this.
+// Truncate the in-memory xb array to its pre-transaction length — O(1), no I/O.
+// This is better compared to resetting complete faiss index from database.
+static int hybridRollback(sqlite3_vtab* pVtab) {
+    HybridVtab* vtab = reinterpret_cast<HybridVtab*>(pVtab);
+    if (vtab->txn_ntotal >= 0 && vtab->faiss_idx) {
+        auto* flat = dynamic_cast<faiss::IndexFlat*>(vtab->faiss_idx.get());
+        if (flat) {
+            flat->xb.resize(static_cast<size_t>(vtab->txn_ntotal) * flat->d);
+            flat->ntotal = vtab->txn_ntotal;
+        }
+    }
+    vtab->txn_ntotal = -1;
+    return SQLITE_OK;
+}
+
 // module registration
 static sqlite3_module hybridSearchModule = {
     0,                // iVersion
@@ -592,10 +621,10 @@ static sqlite3_module hybridSearchModule = {
     hybridColumn,     // xColumn
     hybridRowid,      // xRowid
     hybridUpdate,     // xUpdate
-    nullptr,          // xBegin
+    hybridBegin,      // xBegin
     nullptr,          // xSync
-    nullptr,          // xCommit
-    nullptr,          // xRollback
+    hybridCommit,     // xCommit
+    hybridRollback,   // xRollback
     nullptr,          // xFindMethod
     nullptr,          // xRename
 };
