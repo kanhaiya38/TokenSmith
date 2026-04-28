@@ -263,8 +263,7 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         sqlite_retriever = HybridSQLiteRetriever(
             db_path=config.get("sqlite_db", "index/tokensmith.db"),
             extension_path=config.get("extension_path", "extension/build/hybrid_search.so"),
-            embed_model=cfg.embed_model,
-            faiss_index=faiss_index,
+            embed_model=cfg.embed_model
         )
         retrievers = [sqlite_retriever]
         ranker = EnsembleRanker(

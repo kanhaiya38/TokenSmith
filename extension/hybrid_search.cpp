@@ -605,14 +605,15 @@ static int hybridSync(sqlite3_vtab* pVtab) {
 }
 
 // SQLite has already rolled back the DB before calling this.
-// Truncate the in-memory xb array to its pre-transaction length — O(1), no I/O.
+// Truncate the in-memory codes array to its pre-transaction length — O(1), no I/O.
 // This is better compared to resetting complete faiss index from database.
 static int hybridRollback(sqlite3_vtab* pVtab) {
     HybridVtab* vtab = reinterpret_cast<HybridVtab*>(pVtab);
     if (vtab->txn_ntotal >= 0 && vtab->faiss_idx) {
-        auto* flat = dynamic_cast<faiss::IndexFlat*>(vtab->faiss_idx.get());
+        auto* flat = dynamic_cast<faiss::IndexFlatCodes*>(vtab->faiss_idx.get());
         if (flat) {
-            flat->xb.resize(static_cast<size_t>(vtab->txn_ntotal) * flat->d);
+            flat->codes.resize(static_cast<size_t>(vtab->txn_ntotal) *
+                               flat->d * sizeof(float));
             flat->ntotal = vtab->txn_ntotal;
         }
     }
